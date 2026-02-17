@@ -144,3 +144,4 @@ RAG_API_URL=http://localhost:4000/api/rag
 ```
 
 The middleware proxy will forward to Render automatically.
+# Updated Tue Feb 17 16:39:08 EST 2026
