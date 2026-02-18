@@ -17,7 +17,7 @@ if not PINECONE_API_KEY or not OPENAI_API_KEY:
 
 # Initialize clients
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)
+pinecone_index = pc.Index(INDEX_NAME)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Load terminology from file
@@ -61,7 +61,7 @@ def index():
 def health():
     """Health check"""
     try:
-        stats = index.describe_index_stats()
+        stats = pinecone_index.describe_index_stats()
         return jsonify({
             "status": "healthy",
             "version": APP_VERSION,
@@ -106,7 +106,7 @@ def retrieve_codes():
             filter_dict['specialty'] = specialty
 
         # Query Pinecone
-        results = index.query(
+        results = pinecone_index.query(
             vector=query_embedding,
             top_k=min(top_k * 3, 100),
             include_metadata=True,
@@ -255,7 +255,7 @@ def debug_metadata():
             model="text-embedding-3-small"
         )
         query_embedding = response.data[0].embedding
-        results = index.query(
+        results = pinecone_index.query(
             vector=query_embedding,
             top_k=5,
             include_metadata=True
