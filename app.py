@@ -3,6 +3,7 @@ from pinecone import Pinecone
 from openai import OpenAI
 import json
 import os
+import re
 
 app = Flask(__name__)
 
@@ -40,6 +41,22 @@ except FileNotFoundError:
 except Exception as e:
     print(f"⚠️  Error loading terminology: {e}")
 
+APP_VERSION = "1.0.0"
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root: list endpoints (confirms this app is deployed)."""
+    return jsonify({
+        "service": "medical-rag-api",
+        "version": APP_VERSION,
+        "endpoints": {
+            "GET /health": "Health check (Pinecone + terminology)",
+            "GET /api/debug_metadata": "Inspect raw Pinecone metadata (?query=...)",
+            "POST /api/retrieve": "Retrieve ICD-10/CPT/HCPCS (body: query, specialty?, top_k?)",
+            "POST /retrieve": "Same as /api/retrieve (alias)",
+        },
+    })
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check"""
@@ -47,6 +64,7 @@ def health():
         stats = index.describe_index_stats()
         return jsonify({
             "status": "healthy",
+            "version": APP_VERSION,
             "index": INDEX_NAME,
             "total_vectors": stats.total_vector_count,
             "dimension": stats.dimension,
@@ -56,6 +74,7 @@ def health():
         return jsonify({"status": "unhealthy", "error": str(e)}), 503
 
 @app.route('/api/retrieve', methods=['POST'])
+@app.route('/retrieve', methods=['POST'])
 def retrieve_codes():
     """
     Retrieve medical codes from RAG
@@ -89,12 +108,12 @@ def retrieve_codes():
         # Query Pinecone
         results = index.query(
             vector=query_embedding,
-            top_k=min(top_k * 3, 100),  # Cap at 100 for performance
+            top_k=min(top_k * 3, 100),
             include_metadata=True,
             filter=filter_dict if filter_dict else None
         )
 
-        # Extract codes
+        # Extract codes - try multiple strategies (metadata keys + regex from text)
         icd10_codes = {}
         cpt_codes = {}
         hcpcs_codes = {}
@@ -108,46 +127,77 @@ def retrieve_codes():
             if exclusion_terms and any(term.lower() in chunk_text.lower() for term in exclusion_terms):
                 continue
 
-            # Extract ICD-10
-            icd10_str = metadata.get('icd10_codes', '') or metadata.get('icd10', '')
-            if icd10_str:
-                for code in str(icd10_str).split(','):
-                    code = code.strip()
-                    if code and code not in icd10_codes:
-                        description = f"ICD-10 code {code}"
-                        if code in terminology:
-                            terms = terminology[code].get('positive_terms', [])
-                            if terms:
-                                description = terms[0]
-                        
-                        icd10_codes[code] = {
-                            'code': code,
-                            'description': description,
-                            'score': float(score)
-                        }
+            # STRATEGY 1: Look for codes in metadata (all possible key names)
+            icd10_str = (
+                metadata.get('icd10_codes') or
+                metadata.get('icd10') or
+                metadata.get('icd_10') or
+                metadata.get('icd-10') or
+                ''
+            )
+            cpt_str = (
+                metadata.get('cpt_codes') or
+                metadata.get('cpt') or
+                metadata.get('procedure_codes') or
+                ''
+            )
+            hcpcs_str = (
+                metadata.get('hcpcs_codes') or
+                metadata.get('hcpcs') or
+                ''
+            )
+            from_meta_icd10 = bool(icd10_str)
+            from_meta_cpt = bool(cpt_str)
+            from_meta_hcpcs = bool(hcpcs_str)
 
-            # Extract CPT
-            cpt_str = metadata.get('cpt_codes', '') or metadata.get('cpt', '')
-            if cpt_str:
-                for code in str(cpt_str).split(','):
+            # STRATEGY 2: If no codes in metadata, extract from text
+            if not icd10_str and chunk_text:
+                icd10_matches = re.findall(r'\b[A-TV-Z]\d{2}(?:\.\d{1,4})?\b', chunk_text)
+                if icd10_matches:
+                    icd10_str = ','.join(icd10_matches)
+            if not cpt_str and chunk_text:
+                cpt_matches = re.findall(r'\b\d{5}\b', chunk_text)
+                if cpt_matches:
+                    cpt_str = ','.join(cpt_matches)
+
+            # Process ICD-10
+            if icd10_str:
+                for code in str(icd10_str).replace(';', ',').split(','):
                     code = code.strip()
-                    if code and code not in cpt_codes:
+                    if code and code not in icd10_codes and len(code) >= 3:
+                        if re.match(r'^[A-TV-Z]\d{2}', code):
+                            description = f"ICD-10 code {code}"
+                            if code in terminology:
+                                terms = terminology[code].get('positive_terms', [])
+                                if terms:
+                                    description = terms[0]
+                            icd10_codes[code] = {
+                                'code': code,
+                                'description': description,
+                                'score': float(score),
+                                'source': 'metadata' if from_meta_icd10 else 'text_extraction'
+                            }
+
+            # Process CPT
+            if cpt_str:
+                for code in str(cpt_str).replace(';', ',').split(','):
+                    code = code.strip()
+                    if code and code not in cpt_codes and len(code) == 5 and code.isdigit():
                         description = f"CPT code {code}"
                         if code in terminology:
                             terms = terminology[code].get('positive_terms', [])
                             if terms:
                                 description = terms[0]
-                        
                         cpt_codes[code] = {
                             'code': code,
                             'description': description,
-                            'score': float(score)
+                            'score': float(score),
+                            'source': 'metadata' if from_meta_cpt else 'text_extraction'
                         }
 
-            # Extract HCPCS
-            hcpcs_str = metadata.get('hcpcs_codes', '') or metadata.get('hcpcs', '')
+            # Process HCPCS
             if hcpcs_str:
-                for code in str(hcpcs_str).split(','):
+                for code in str(hcpcs_str).replace(';', ',').split(','):
                     code = code.strip()
                     if code and code not in hcpcs_codes:
                         description = f"HCPCS code {code}"
@@ -155,11 +205,11 @@ def retrieve_codes():
                             terms = terminology[code].get('positive_terms', [])
                             if terms:
                                 description = terms[0]
-                        
                         hcpcs_codes[code] = {
                             'code': code,
                             'description': description,
-                            'score': float(score)
+                            'score': float(score),
+                            'source': 'metadata' if from_meta_hcpcs else 'text_extraction'
                         }
 
         # Sort and limit
@@ -177,7 +227,11 @@ def retrieve_codes():
                 'region': region,
                 'total_results': len(results.matches),
                 'filtered_results': len(icd10_codes) + len(cpt_codes) + len(hcpcs_codes),
-                'source': 'render_rag_v1'
+                'source': 'render_rag_v1',
+                'extraction_methods_used': {
+                    'metadata_fields': True,
+                    'text_extraction': True
+                }
             }
         })
 
@@ -186,6 +240,44 @@ def retrieve_codes():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/debug_metadata', methods=['GET'])
+def debug_metadata():
+    """
+    Inspect raw Pinecone metadata for the first few matches.
+    Query param: query (e.g. ?query=anxiety). Returns metadata keys and sample values.
+    """
+    try:
+        query = (request.args.get('query') or 'anxiety').strip()
+        response = openai_client.embeddings.create(
+            input=query,
+            model="text-embedding-3-small"
+        )
+        query_embedding = response.data[0].embedding
+        results = index.query(
+            vector=query_embedding,
+            top_k=5,
+            include_metadata=True
+        )
+        out = {
+            "query": query,
+            "num_matches": len(results.matches),
+            "match_metadata_samples": []
+        }
+        for i, match in enumerate(results.matches):
+            meta = match.metadata or {}
+            out["match_metadata_samples"].append({
+                "match_index": i,
+                "score": getattr(match, 'score', None),
+                "metadata_keys": list(meta.keys()),
+                "metadata": {k: (v[:200] + "..." if isinstance(v, str) and len(v) > 200 else v) for k, v in meta.items()}
+            })
+        return jsonify(out)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
