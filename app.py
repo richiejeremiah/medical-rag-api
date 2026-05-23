@@ -212,6 +212,42 @@ def retrieve_codes():
                             'source': 'metadata' if from_meta_hcpcs else 'text_extraction'
                         }
 
+        # Merge aggregated metadata codes (same strategy as doclittle flask-retrieve-cpt-patch)
+        from rag_aggregate import aggregate_codes_from_matches
+
+        match_dicts = [
+            {"metadata": m.metadata or {}, "score": m.score}
+            for m in results.matches
+        ]
+        for item in aggregate_codes_from_matches(match_dicts, "icd10_codes"):
+            code = item["code"]
+            if code not in icd10_codes and re.match(r"^[A-TV-Z]\d{2}", code):
+                description = f"ICD-10 code {code}"
+                if code in terminology:
+                    terms = terminology[code].get("positive_terms", [])
+                    if terms:
+                        description = terms[0]
+                icd10_codes[code] = {
+                    "code": code,
+                    "description": description,
+                    "score": float(item["score"]),
+                    "source": "metadata_aggregate",
+                }
+        for item in aggregate_codes_from_matches(match_dicts, "cpt_codes"):
+            code = item["code"]
+            if code not in cpt_codes and len(code) == 5 and code.isdigit():
+                description = f"CPT code {code}"
+                if code in terminology:
+                    terms = terminology[code].get("positive_terms", [])
+                    if terms:
+                        description = terms[0]
+                cpt_codes[code] = {
+                    "code": code,
+                    "description": description,
+                    "score": float(item["score"]),
+                    "source": "metadata_aggregate",
+                }
+
         # Sort and limit
         icd10_list = sorted(icd10_codes.values(), key=lambda x: x['score'], reverse=True)[:20]
         cpt_list = sorted(cpt_codes.values(), key=lambda x: x['score'], reverse=True)[:15]
